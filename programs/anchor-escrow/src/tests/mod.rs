@@ -40,6 +40,8 @@ mod tests {
 
     static PROGRAM_ID: Pubkey = crate::ID;
 
+    // Setup function to initialize LiteSVM and create a payer keypair
+    // Also loads an account from devnet into the LiteSVM environment (for testing purposes)
     fn setup() -> (LiteSVM, Keypair) {
         // Initialize LiteSVM and payer
         let mut program = LiteSVM::new();
@@ -59,12 +61,16 @@ mod tests {
         program.add_program(PROGRAM_ID, &program_data);
 
         // Example on how to Load an account from devnet
+        // LiteSVM does not have access to real Solana network data since it does not have network access,
+        // so we use an RPC client to fetch account data from devnet
         let rpc_client = RpcClient::new("https://api.devnet.solana.com");
         let account_address = Address::from_str("DRYvf71cbF2s5wgaJQvAGkghMkRcp5arvsK2w97vXhi2").unwrap();
         let fetched_account = rpc_client
             .get_account(&account_address)
             .expect("Failed to fetch account from devnet");
 
+        // Set the fetched account in the LiteSVM environment
+        // This allows us to simulate interactions with this account during testing
         program.set_account(payer.pubkey(), Account { 
             lamports: fetched_account.lamports, 
             data: fetched_account.data, 
@@ -89,6 +95,7 @@ mod tests {
         let maker = payer.pubkey();
         
         // Create two mints (Mint A and Mint B) with 6 decimal places and the maker as the authority
+        // This done using litesvm-token's CreateMint utility which creates the mint in the LiteSVM environment
         let mint_a = CreateMint::new(&mut program, &payer)
             .decimals(6)
             .authority(&maker)
@@ -104,6 +111,7 @@ mod tests {
         msg!("Mint B: {}\n", mint_b);
 
         // Create the maker's associated token account for Mint A
+        // This is done using litesvm-token's CreateAssociatedTokenAccount utility
         let maker_ata_a = CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_a)
             .owner(&maker).send().unwrap();
         msg!("Maker ATA A: {}\n", maker_ata_a);
