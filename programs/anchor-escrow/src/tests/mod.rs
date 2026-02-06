@@ -47,11 +47,6 @@ mod tests {
         let mut program = LiteSVM::new();
         let payer = Keypair::new();
     
-        // Airdrop some SOL to the payer keypair
-        program
-            .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
-            .expect("Failed to airdrop SOL to payer");
-    
         // Load program SO file
         let so_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/deploy/anchor_escrow.so");
@@ -78,6 +73,11 @@ mod tests {
             executable: fetched_account.executable, 
             rent_epoch: fetched_account.rent_epoch 
         }).unwrap();
+
+        // Airdrop some SOL to the payer keypair
+        program
+        .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .expect("Failed to airdrop SOL to payer");
 
         msg!("Lamports of fetched account: {}", fetched_account.lamports);
     
@@ -184,5 +184,152 @@ mod tests {
         assert_eq!(escrow_data.receive, 10);
         
     }
+
+    #[test]
+    fn test_take() {
+        let (mut program, payer) = setup();
+
+        let maker = payer.pubkey();
+        let taker = Keypair::new();
+        program.airdrop(&taker.pubkey(), 20 * LAMPORTS_PER_SOL).unwrap();
+
+       // Create mints
+        let mint_a = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+
+        let mint_b = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+
+        // ATAs
+        let maker_ata_a =
+        CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_a)
+            .owner(&maker)
+            .send()
+            .unwrap();
+        // program.airdrop(&payer.pubkey(), 0).unwrap();
+
+        let maker_ata_b =
+        CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_b)
+            .owner(&maker)
+            .send()
+            .unwrap();
+
+
+        let taker_ata_a =
+        CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_a)
+            .owner(&taker.pubkey())
+            .send()
+            .unwrap();
+
+
+        let taker_ata_b =
+        CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_b)
+            .owner(&taker.pubkey())
+            .send()
+            .unwrap();
+
+
+        // Mint tokens
+        MintTo::new(&mut program, &payer, &mint_a, &maker_ata_a, 10)
+        .send()
+        .unwrap();
+
+
+        MintTo::new(&mut program, &payer, &mint_b, &taker_ata_b, 10)
+        .send()
+        .unwrap();
+
+        // PDA derivations
+        let seed = 123u64;
+        let escrow = Pubkey::find_program_address(
+            &[b"escrow", maker.as_ref(), &seed.to_le_bytes()],
+            &PROGRAM_ID,
+        ).0;
+
+        let vault = associated_token::get_associated_token_address(&escrow, &mint_a);
+
+        // MAKE
+        let make_ix = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: crate::accounts::Make {
+                maker,
+                mint_a,
+                mint_b,
+                maker_ata_a,
+                escrow,
+                vault,
+                associated_token_program: spl_associated_token_account::ID,
+                token_program: TOKEN_PROGRAM_ID,
+                system_program: SYSTEM_PROGRAM_ID,
+            }
+            .to_account_metas(None),
+            data: crate::instruction::Make {
+                deposit: 10,
+                seed,
+                receive: 10,
+            }
+            .data(),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[make_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            program.latest_blockhash(),
+        );
+        program.send_transaction(tx).unwrap();
+
+        
+        // TAKE
+        let take_ix = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: crate::accounts::Take {
+                taker: taker.pubkey(),
+                maker,
+                mint_a,
+                mint_b,
+                taker_ata_a,
+                taker_ata_b,
+                maker_ata_b,
+                escrow,
+                vault,
+                associated_token_program: spl_associated_token_account::ID,
+                token_program: TOKEN_PROGRAM_ID,
+                system_program: SYSTEM_PROGRAM_ID,
+            }
+            .to_account_metas(None),
+            data: crate::instruction::Take {}.data(),
+        };
+        
+        let tx = Transaction::new_signed_with_payer(
+            &[take_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &taker],
+            program.latest_blockhash(),
+        );
+        program.send_transaction(tx).unwrap();
+
+        // Assertions
+        let taker_a =
+            spl_token::state::Account::unpack(&program.get_account(&taker_ata_a).unwrap().data).unwrap();
+        assert_eq!(taker_a.amount, 10);
+
+        let maker_b =
+            spl_token::state::Account::unpack(&program.get_account(&maker_ata_b).unwrap().data).unwrap();
+        assert_eq!(maker_b.amount, 10);
+
+        let escrow_account = program.get_account(&escrow).unwrap();
+        msg!("escrow lamports: {}", escrow_account.lamports);
+        msg!("escrow owner: {}", escrow_account.owner);
+        msg!("escrow data len: {}", escrow_account.data.len());
+    }
+
+        
 
 }
