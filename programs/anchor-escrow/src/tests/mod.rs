@@ -323,13 +323,107 @@ mod tests {
         let maker_b =
             spl_token::state::Account::unpack(&program.get_account(&maker_ata_b).unwrap().data).unwrap();
         assert_eq!(maker_b.amount, 10);
-
-        let escrow_account = program.get_account(&escrow).unwrap();
-        msg!("escrow lamports: {}", escrow_account.lamports);
-        msg!("escrow owner: {}", escrow_account.owner);
-        msg!("escrow data len: {}", escrow_account.data.len());
+        let vault_account = program.get_account(&vault).unwrap();
+        msg!("vault lamports: {}", vault_account.lamports);
+        msg!("vault owner: {}", vault_account.owner);
+        msg!("vault data len: {}", vault_account.data.len());
     }
 
-        
+    #[test]
+fn test_refund() {
+    let (mut program, payer) = setup();
+    let maker = payer.pubkey();
+
+    let mint_a = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+
+    let mint_b = CreateMint::new(&mut program, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+
+    let maker_ata_a =
+        CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_a)
+            .owner(&maker)
+            .send()
+            .unwrap();
+
+    MintTo::new(&mut program, &payer, &mint_a, &maker_ata_a, 10).send().unwrap();
+
+    let seed = 123u64;
+    let escrow = Pubkey::find_program_address(
+        &[b"escrow", maker.as_ref(), &seed.to_le_bytes()],
+        &PROGRAM_ID,
+    ).0;
+
+    let vault = associated_token::get_associated_token_address(&escrow, &mint_a);
+
+    // MAKE
+    let make_ix = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: crate::accounts::Make {
+            maker,
+            mint_a,
+            mint_b,
+            maker_ata_a,
+            escrow,
+            vault,
+            associated_token_program: spl_associated_token_account::ID,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: crate::instruction::Make {
+            deposit: 10,
+            seed,
+            receive: 10,
+        }
+        .data(),
+    };
+
+    program
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[make_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            program.latest_blockhash(),
+        ))
+        .unwrap();
+
+    // REFUND
+    let refund_ix = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: crate::accounts::Refund {
+            maker,
+            mint_a,
+            maker_ata_a,
+            escrow,
+            vault,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: crate::instruction::Refund {}.data(),
+    };
+
+    program
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[refund_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            program.latest_blockhash(),
+        ))
+        .unwrap();
+
+    let maker_a =
+        spl_token::state::Account::unpack(&program.get_account(&maker_ata_a).unwrap().data).unwrap();
+    assert_eq!(maker_a.amount, 10);
+
+}
+
 
 }
