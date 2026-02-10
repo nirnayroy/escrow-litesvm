@@ -1,108 +1,179 @@
-use anchor_lang::prelude::*;
-use anchor_spl::{associated_token::AssociatedToken, token_interface::{Mint, TokenAccount, TokenInterface, TransferChecked, transfer_checked, CloseAccount, close_account}};
-
 use crate::state::Escrow;
+use crate::EscrowError;
+use anchor_lang::prelude::Clock;
+use anchor_lang::prelude::*;
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token_interface::{
+        close_account, transfer_checked, CloseAccount, Mint, TokenAccount, TokenInterface,
+        TransferChecked,
+    },
+};
+
+const FIVE_DAYS: i64 = 5 * 24 * 60 * 60;
 
 //Create context
 #[derive(Accounts)]
 pub struct Take<'info> {
-    #[account(mut)]
     pub taker: Signer<'info>,
-    #[account(mut)]
-    pub maker: SystemAccount<'info>,
+
+    /// CHECK: maker only used as seed + lamport destination
+    pub maker: UncheckedAccount<'info>,
+
     pub mint_a: InterfaceAccount<'info, Mint>,
     pub mint_b: InterfaceAccount<'info, Mint>,
-    #[account(
-        init_if_needed,
-        payer = taker,
-        associated_token::mint = mint_a,
-        associated_token::authority = taker,
-    )]
+
+    #[account(mut)]
     pub taker_ata_a: InterfaceAccount<'info, TokenAccount>,
-    #[account(
-        mut,
-        associated_token::mint = mint_b,
-        associated_token::authority = taker,
-    )]
+    #[account(mut)]
     pub taker_ata_b: InterfaceAccount<'info, TokenAccount>,
-    #[account(
-        init_if_needed,
-        payer = taker,
-        associated_token::mint = mint_b,
-        associated_token::authority = maker,
-    )]
+    #[account(mut)]
     pub maker_ata_b: InterfaceAccount<'info, TokenAccount>,
+
     #[account(
         mut,
-        close = maker,
-        has_one = maker,
-        has_one = mint_a,
-        has_one = mint_b,
-        seeds = [b"escrow", maker.key().as_ref(), escrow.seed.to_le_bytes().as_ref()],
+        seeds = [
+            b"escrow",
+            escrow.maker.as_ref(),
+            escrow.seed.to_le_bytes().as_ref(),
+        ],
         bump = escrow.bump,
+        close = maker,
     )]
     pub escrow: Account<'info, Escrow>,
+
     #[account(
         mut,
         associated_token::mint = mint_a,
         associated_token::authority = escrow,
     )]
     pub vault: InterfaceAccount<'info, TokenAccount>,
+
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
-//Deposit tokens from taker to maker
-//Transfer tokens from vault to taker
-//Close vault account
 impl<'info> Take<'info> {
-    pub fn deposit(&mut self) -> Result<()> {
-        let cpi_program = self.token_program.to_account_info();
+    pub fn take(&mut self) -> Result<()> {
+        msg!("Instruction: Take");
+        require!(
+            self.escrow.maker != Pubkey::default(),
+            EscrowError::InvalidEscrow
+        );
 
-        let cpi_accounts = TransferChecked {
-            from: self.taker_ata_b.to_account_info(),
-            to: self.maker_ata_b.to_account_info(),
-            authority: self.taker.to_account_info(),
-            mint: self.mint_b.to_account_info(),
-        };
+        // ─────────────────────────────
+        // 1. Enforce time lock
+        // ─────────────────────────────
+        let clock = Clock::get()?;
+        msg!("Current ts: {}", clock.unix_timestamp);
+        msg!("Escrow created_at: {}", self.escrow.created_at);
 
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        require!(
+            clock.unix_timestamp >= self.escrow.created_at + FIVE_DAYS,
+            EscrowError::EscrowNotMature
+        );
 
-        transfer_checked(cpi_ctx, self.escrow.receive, self.mint_b.decimals)
-    }
+        // ─────────────────────────────
+        // 2. Prepare PDA signer seeds (LIFETIME SAFE)
+        // ─────────────────────────────
 
-    pub fn withdraw_and_close_vault(&mut self) -> Result<()> {
-        let signer_seeds: [&[&[u8]]; 1] = [&[
+        msg!("Maker key: {}", self.escrow.maker);
+        msg!("Escrow seed: {}", self.escrow.seed);
+        msg!("Escrow bump: {}", self.escrow.bump);
+        msg!("Escrow PDA: {}", self.escrow.key());
+
+        let escrow_seeds: &[&[u8]] = &[
             b"escrow",
-            self.maker.key.as_ref(),
-            &self.escrow.seed.to_le_bytes()[..],
-            &[self.escrow.bump]
-        ]];
+            self.escrow.maker.as_ref(),
+            &self.escrow.seed.to_le_bytes(),
+            &[self.escrow.bump],
+        ];
 
-        let cpi_program = self.token_program.to_account_info();
+        let signer_seeds: &[&[&[u8]]] = &[escrow_seeds];
 
-        let cpi_accounts = TransferChecked {
-            from: self.vault.to_account_info(),
-            to: self.taker_ata_a.to_account_info(),
-            authority: self.escrow.to_account_info(),
-            mint: self.mint_a.to_account_info(),
-        };
+        // ─────────────────────────────
+        // 3. Sanity checks (prevent UB)
+        // ─────────────────────────────
+        require_keys_eq!(
+            self.vault.owner,
+            self.escrow.key(),
+            EscrowError::InvalidVaultAuthority
+        );
 
-        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, &signer_seeds);
+        msg!("Vault amount: {}", self.vault.amount);
+        msg!("Escrow expects receive: {}", self.escrow.receive);
 
-        transfer_checked(cpi_context, self.vault.amount, self.mint_a.decimals)?;
+        let token_program = self.token_program.to_account_info();
+        require!(
+            self.vault.owner == self.escrow.key(),
+            EscrowError::InvalidVaultAuthority
+        );
 
-        let cpi_program = self.token_program.to_account_info();
+        require!(self.vault.amount > 0, EscrowError::EmptyVault);
 
-        let cpi_accounts = CloseAccount {
-            account: self.vault.to_account_info(),
-            destination: self.maker.to_account_info(),
-            authority: self.escrow.to_account_info(),
-        };
+        // ─────────────────────────────
+        // 4. Taker → Maker (mint_b)
+        // ─────────────────────────────
+        {
+            msg!("Transferring mint_b from taker → maker");
 
-        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, &signer_seeds);
+            let cpi_accounts = TransferChecked {
+                from: self.taker_ata_b.to_account_info(),
+                to: self.maker_ata_b.to_account_info(),
+                authority: self.taker.to_account_info(),
+                mint: self.mint_b.to_account_info(),
+            };
 
-        close_account(cpi_context)
+            let cpi_ctx = CpiContext::new(token_program.clone(), cpi_accounts);
+
+            transfer_checked(cpi_ctx, self.escrow.receive, self.mint_b.decimals)?;
+        }
+
+        // ─────────────────────────────
+        // 5. Vault → Taker (mint_a)
+        // ─────────────────────────────
+        {
+            msg!("Transferring mint_a from vault → taker");
+
+            let amount = self.vault.amount;
+            require!(amount > 0, EscrowError::EmptyVault);
+
+            let cpi_accounts = TransferChecked {
+                from: self.vault.to_account_info(),
+                to: self.taker_ata_a.to_account_info(),
+                authority: self.escrow.to_account_info(),
+                mint: self.mint_a.to_account_info(),
+            };
+
+            let cpi_ctx =
+                CpiContext::new_with_signer(token_program.clone(), cpi_accounts, signer_seeds);
+
+            transfer_checked(cpi_ctx, amount, self.mint_a.decimals)?;
+        }
+
+        // ─────────────────────────────
+        // 6. Close vault (LAST use of escrow PDA)
+        // ─────────────────────────────
+        {
+            msg!("Closing vault");
+
+            let cpi_accounts = CloseAccount {
+                account: self.vault.to_account_info(),
+                destination: self.maker.to_account_info(),
+                authority: self.escrow.to_account_info(),
+            };
+
+            let cpi_ctx = CpiContext::new_with_signer(token_program, cpi_accounts, signer_seeds);
+
+            close_account(cpi_ctx)?;
+        }
+
+        // ─────────────────────────────
+        // 7. Escrow auto-closes via `close = maker`
+        // ─────────────────────────────
+        msg!("Take completed successfully");
+
+        Ok(())
     }
 }

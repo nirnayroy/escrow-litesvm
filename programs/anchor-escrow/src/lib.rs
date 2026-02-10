@@ -3,9 +3,11 @@
 
 use anchor_lang::prelude::*;
 
-mod state;
+pub mod error;
 mod instructions;
+mod state;
 mod tests;
+pub use error::*;
 
 use instructions::*;
 
@@ -17,7 +19,18 @@ pub mod anchor_escrow {
 
     pub fn make(ctx: Context<Make>, seed: u64, deposit: u64, receive: u64) -> Result<()> {
         ctx.accounts.init_escrow(seed, receive, &ctx.bumps)?;
-        ctx.accounts.deposit(deposit)
+        ctx.accounts.deposit(deposit);
+        let escrow = &mut ctx.accounts.escrow;
+        let clock = Clock::get()?;
+
+        escrow.maker = ctx.accounts.maker.key();
+        escrow.mint_a = ctx.accounts.mint_a.key();
+        escrow.mint_b = ctx.accounts.mint_b.key();
+        escrow.receive = receive;
+        escrow.seed = seed;
+        escrow.bump = ctx.bumps.escrow;
+        escrow.created_at = clock.unix_timestamp;
+        Ok(())
     }
 
     pub fn refund(ctx: Context<Refund>) -> Result<()> {
@@ -25,7 +38,6 @@ pub mod anchor_escrow {
     }
 
     pub fn take(ctx: Context<Take>) -> Result<()> {
-        ctx.accounts.deposit()?;
-        ctx.accounts.withdraw_and_close_vault()
+        ctx.accounts.take()
     }
 }
